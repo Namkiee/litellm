@@ -258,8 +258,10 @@ router_settings:
 | enable_oauth2_proxy_auth | boolean | (Enterprise Feature) If true, enables oauth2.0 authentication |
 | forward_openai_org_id | boolean | If true, forwards the OpenAI Organization ID to the backend LLM call (if it's OpenAI). |
 | forward_client_headers_to_llm_api | boolean | If true, forwards the client headers (any `x-` headers and `anthropic-beta` headers) to the backend LLM call |
-| maximum_spend_logs_retention_period               | str                   | Used to set the max retention time for spend logs in the db, after which they will be auto-purged                                                                                                                                                                                                                             |
-| maximum_spend_logs_retention_interval | str | Used to set the interval in which the spend log cleanup task should run in.                                                                                                                                                                                                                                                   |
+| maximum_spend_logs_retention_period | str | Used to set the max retention time for spend logs in the db, after which they will be auto-purged. |
+| maximum_spend_logs_retention_interval | str | Interval at which the spend log cleanup task should run. |
+| s3_logs_retention_period | str | Maximum age for S3/MinIO log objects before LiteLLM deletes them. |
+| s3_logs_retention_interval | str | Interval between S3 log cleanup executions (defaults to 24h when omitted). |
 ### router_settings - Reference
 
 :::info

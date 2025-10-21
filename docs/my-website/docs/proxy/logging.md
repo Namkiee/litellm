@@ -1363,6 +1363,20 @@ curl --location 'http://0.0.0.0:4000/chat/completions' \
 
 Your logs should be available on the specified s3 Bucket
 
+### Automatically delete old S3 logs
+
+LiteLLM can prune objects stored by the S3/MinIO logging callback. The cleanup job reuses the credentials defined in `s3_callback_params`.
+
+Add the retention policy under `general_settings`:
+
+```yaml title="proxy_config.yaml"
+general_settings:
+  s3_logs_retention_period: "30d"        # remove objects older than 30 days
+  s3_logs_retention_interval: "12h"      # optional (defaults to 24h)
+```
+
+Use the same duration syntax as other settings (`7d`, `24h`, `3600s`, etc.). LiteLLM coordinates the cleanup with a distributed lock so only one proxy instance deletes logs at a time.
+
 ### Team Alias Prefix in Object Key
 
 **This is a preview feature**

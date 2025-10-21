@@ -4043,6 +4043,26 @@ class ProxyStartupEvent:
 
         await cls._initialize_spend_tracking_background_jobs(scheduler=scheduler)
 
+        ### S3 LOG CLEANUP ###
+        if general_settings.get("s3_logs_retention_period") is not None:
+            try:
+                from litellm.proxy.common_utils.s3_log_cleanup import S3LogCleanup
+
+                s3_log_cleanup = S3LogCleanup()
+                s3_retention_interval = general_settings.get(
+                    "s3_logs_retention_interval", "1d"
+                )
+                interval_seconds = duration_in_seconds(s3_retention_interval)
+                scheduler.add_job(
+                    s3_log_cleanup.cleanup_old_s3_logs,
+                    "interval",
+                    seconds=interval_seconds,
+                )
+            except ValueError:
+                verbose_proxy_logger.error(
+                    "Invalid s3_logs_retention_interval value"
+                )
+
         ### SPEND LOG CLEANUP ###
         if general_settings.get("maximum_spend_logs_retention_period") is not None:
             spend_log_cleanup = SpendLogCleanup()
