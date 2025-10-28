@@ -4062,6 +4062,34 @@ class ProxyStartupEvent:
                 verbose_proxy_logger.error(
                     "Invalid maximum_spend_logs_retention_interval value"
                 )
+
+        ### S3 LOG RETENTION ###
+        if general_settings.get("s3_log_retention_period") is not None:
+            try:
+                from litellm.proxy.logging.s3_log_retention import S3LogRetentionJob
+
+                s3_log_retention_job = S3LogRetentionJob(
+                    general_settings=general_settings,
+                    proxy_logging_obj=proxy_logging_obj,
+                )
+                retention_interval = general_settings.get(
+                    "s3_log_retention_interval", "1d"
+                )
+                interval_seconds = duration_in_seconds(retention_interval)
+                scheduler.add_job(
+                    s3_log_retention_job.run,
+                    "interval",
+                    seconds=interval_seconds,
+                    next_run_time=datetime.now() + timedelta(seconds=10),
+                )
+            except ValueError:
+                verbose_proxy_logger.error(
+                    "Invalid s3_log_retention_interval value"
+                )
+            except Exception as exc:
+                verbose_proxy_logger.error(
+                    "Failed to schedule S3 log retention job: %s", exc
+                )
         ### CHECK BATCH COST ###
         if llm_router is not None:
             try:

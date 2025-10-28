@@ -7,12 +7,16 @@ NOTE 1: S3 does not provide a BATCH PUT API endpoint, so we create tasks to uplo
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, cast
 
 import litellm
 from litellm._logging import print_verbose, verbose_logger
-from litellm.constants import DEFAULT_S3_BATCH_SIZE, DEFAULT_S3_FLUSH_INTERVAL_SECONDS
+from litellm.constants import (
+    DEFAULT_S3_BATCH_SIZE,
+    DEFAULT_S3_FLUSH_INTERVAL_SECONDS,
+    S3_LOG_RETENTION_DELETE_BATCH_SIZE,
+)
 from litellm.integrations.s3 import get_s3_object_key
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.llms.bedrock.base_aws_llm import BaseAWSLLM
@@ -559,6 +563,194 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
         except Exception as e:
             verbose_logger.exception(f"Error downloading from S3: {str(e)}")
             return None
+
+    async def async_cleanup_old_logs(
+        self, retention_seconds: int, max_objects: Optional[int] = None
+    ) -> int:
+        """Delete S3 log objects older than the configured retention window."""
+
+        if self.s3_bucket_name is None:
+            verbose_logger.info("S3 log retention skipped - bucket not configured")
+            return 0
+
+        if retention_seconds <= 0:
+            verbose_logger.info(
+                "S3 log retention skipped - retention window not positive"
+            )
+            return 0
+
+        prefix: Optional[str] = None
+        if isinstance(self.s3_path, str):
+            trimmed_path = self.s3_path.strip("/")
+            if trimmed_path:
+                prefix = f"{trimmed_path}/"
+
+        try:
+            import boto3
+        except ImportError:
+            raise ImportError("Missing boto3 to call S3. Run 'pip install boto3'.")
+
+        try:
+            from litellm.litellm_core_utils.asyncify import asyncify
+
+            asyncified_get_credentials = asyncify(self.get_credentials)
+            credentials = await asyncified_get_credentials(
+                aws_access_key_id=self.s3_aws_access_key_id,
+                aws_secret_access_key=self.s3_aws_secret_access_key,
+                aws_session_token=self.s3_aws_session_token,
+                aws_region_name=self.s3_region_name,
+                aws_session_name=self.s3_aws_session_name,
+                aws_profile_name=self.s3_aws_profile_name,
+                aws_role_name=self.s3_aws_role_name,
+                aws_web_identity_token=self.s3_aws_web_identity_token,
+                aws_sts_endpoint=self.s3_aws_sts_endpoint,
+            )
+        except Exception as exc:
+            verbose_logger.exception(
+                "Error retrieving credentials for S3 log retention: %s", str(exc)
+            )
+            return 0
+
+        try:
+            s3_client = boto3.client(
+                "s3",
+                region_name=self.s3_region_name,
+                endpoint_url=self.s3_endpoint_url,
+                api_version=self.s3_api_version,
+                use_ssl=self.s3_use_ssl,
+                verify=self.s3_verify,
+                aws_access_key_id=getattr(credentials, "access_key", None),
+                aws_secret_access_key=getattr(credentials, "secret_key", None),
+                aws_session_token=getattr(credentials, "token", None),
+                config=self.s3_config,
+            )
+        except Exception as exc:
+            verbose_logger.exception(
+                "Error creating boto3 client for S3 log retention: %s", str(exc)
+            )
+            return 0
+
+        cutoff_time = datetime.now(timezone.utc) - timedelta(
+            seconds=float(retention_seconds)
+        )
+        total_deleted = 0
+        continuation_token: Optional[str] = None
+
+        if max_objects is not None:
+            try:
+                max_objects = int(max_objects)
+            except (TypeError, ValueError):
+                verbose_logger.warning(
+                    "Invalid max_objects provided to S3 log retention. Ignoring override."
+                )
+                max_objects = None
+            else:
+                if max_objects <= 0:
+                    verbose_logger.info(
+                        "S3 log retention skip requested - max deletions is non-positive"
+                    )
+                    return 0
+
+        try:
+            while True:
+                list_kwargs = {"Bucket": self.s3_bucket_name}
+                if prefix:
+                    list_kwargs["Prefix"] = prefix
+                if continuation_token:
+                    list_kwargs["ContinuationToken"] = continuation_token
+
+                response = await asyncio.to_thread(
+                    s3_client.list_objects_v2, **list_kwargs
+                )
+
+                contents = response.get("Contents", []) or []
+                if not contents and not response.get("IsTruncated"):
+                    break
+
+                keys_to_delete: List[str] = []
+                for obj in contents:
+                    key = obj.get("Key")
+                    if key is None:
+                        continue
+
+                    last_modified = obj.get("LastModified")
+                    if isinstance(last_modified, str):
+                        try:
+                            last_modified_dt = datetime.fromisoformat(
+                                last_modified.replace("Z", "+00:00")
+                            )
+                        except ValueError:
+                            verbose_logger.debug(
+                                "Unable to parse LastModified for key %s", key
+                            )
+                            continue
+                    else:
+                        last_modified_dt = last_modified
+
+                    if last_modified_dt is None:
+                        continue
+
+                    if getattr(last_modified_dt, "tzinfo", None) is None:
+                        last_modified_dt = last_modified_dt.replace(
+                            tzinfo=timezone.utc
+                        )
+
+                    if last_modified_dt < cutoff_time:
+                        keys_to_delete.append(key)
+
+                if keys_to_delete:
+                    for start_index in range(
+                        0, len(keys_to_delete), S3_LOG_RETENTION_DELETE_BATCH_SIZE
+                    ):
+                        if max_objects is not None and total_deleted >= max_objects:
+                            break
+
+                        batch_keys = keys_to_delete[
+                            start_index : start_index
+                            + S3_LOG_RETENTION_DELETE_BATCH_SIZE
+                        ]
+
+                        if max_objects is not None:
+                            remaining = max_objects - total_deleted
+                            if remaining <= 0:
+                                break
+                            batch_keys = batch_keys[:remaining]
+
+                        if not batch_keys:
+                            break
+
+                        await asyncio.to_thread(
+                            s3_client.delete_objects,
+                            Bucket=self.s3_bucket_name,
+                            Delete={
+                                "Objects": [{"Key": batch_key} for batch_key in batch_keys]
+                            },
+                        )
+                        total_deleted += len(batch_keys)
+                        verbose_logger.info(
+                            "Deleted %s S3 log objects", len(batch_keys)
+                        )
+
+                        if max_objects is not None and total_deleted >= max_objects:
+                            break
+
+                if max_objects is not None and total_deleted >= max_objects:
+                    break
+
+                if response.get("IsTruncated"):
+                    continuation_token = response.get("NextContinuationToken")
+                    if continuation_token is None:
+                        break
+                else:
+                    break
+
+        except Exception as exc:
+            verbose_logger.exception(
+                "Error while running S3 log retention: %s", str(exc)
+            )
+            return total_deleted
+
+        return total_deleted
 
     async def get_proxy_server_request_from_cold_storage_with_object_key(
         self,
