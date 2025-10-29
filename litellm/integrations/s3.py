@@ -1,11 +1,15 @@
 #### What this does ####
 #    On success + failure, log events to Supabase
 
-from datetime import datetime
+import asyncio
+import re
+from collections import deque
+from datetime import datetime, timedelta, timezone
 from typing import Optional, cast
 
 import litellm
 from litellm._logging import print_verbose, verbose_logger
+from litellm.constants import S3_LOG_RETENTION_DELETE_BATCH_SIZE
 from litellm.types.utils import StandardLoggingPayload
 
 
@@ -177,6 +181,170 @@ class S3Logger:
         except Exception as e:
             verbose_logger.exception(f"s3 Layer Error - {str(e)}")
             pass
+
+
+    async def async_cleanup_old_logs(
+        self, retention_seconds: int, max_objects: Optional[int] = None
+    ) -> int:
+        """Delete dated S3 log directories older than the retention window."""
+
+        if self.bucket_name is None:
+            verbose_logger.info("S3 log retention skipped - bucket not configured")
+            return 0
+
+        if retention_seconds <= 0:
+            verbose_logger.info(
+                "S3 log retention skipped - retention window not positive"
+            )
+            return 0
+
+        prefix: Optional[str] = None
+        if isinstance(self.s3_path, str):
+            trimmed_path = self.s3_path.strip("/")
+            if trimmed_path:
+                prefix = f"{trimmed_path}/"
+
+        cutoff_date = (
+            datetime.now(timezone.utc) - timedelta(seconds=float(retention_seconds))
+        ).date()
+        total_deleted = 0
+        date_directory_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+        prefixes_to_scan = deque([prefix] if prefix else [""])
+        seen_prefixes = set()
+        directory_prefixes = []
+        directory_prefixes_seen = set()
+
+        # Normalize max_objects to a positive integer if provided
+        if max_objects is not None:
+            try:
+                max_objects = int(max_objects)
+            except (TypeError, ValueError):
+                verbose_logger.warning(
+                    "Invalid max_objects provided to S3 log retention. Ignoring override."
+                )
+                max_objects = None
+            else:
+                if max_objects <= 0:
+                    verbose_logger.info(
+                        "S3 log retention skip requested - max deletions is non-positive"
+                    )
+                    return 0
+
+        try:
+            while prefixes_to_scan:
+                current_prefix = prefixes_to_scan.popleft()
+                if current_prefix in seen_prefixes:
+                    continue
+                seen_prefixes.add(current_prefix)
+
+                continuation_token: Optional[str] = None
+                while True:
+                    list_kwargs = {"Bucket": self.bucket_name, "Delimiter": "/"}
+                    if current_prefix:
+                        list_kwargs["Prefix"] = current_prefix
+                    if continuation_token:
+                        list_kwargs["ContinuationToken"] = continuation_token
+
+                    response = await asyncio.to_thread(
+                        self.s3_client.list_objects_v2, **list_kwargs
+                    )
+
+                    for prefix_info in response.get("CommonPrefixes", []) or []:
+                        child_prefix = prefix_info.get("Prefix")
+                        if not child_prefix:
+                            continue
+                        last_segment = child_prefix.rstrip("/").split("/")[-1]
+                        if date_directory_pattern.match(last_segment):
+                            try:
+                                directory_date = datetime.strptime(
+                                    last_segment, "%Y-%m-%d"
+                                ).date()
+                            except ValueError:
+                                continue
+                            if directory_date < cutoff_date and (
+                                child_prefix not in directory_prefixes_seen
+                            ):
+                                directory_prefixes_seen.add(child_prefix)
+                                directory_prefixes.append(child_prefix)
+                        else:
+                            prefixes_to_scan.append(child_prefix)
+
+                    if response.get("IsTruncated"):
+                        continuation_token = response.get("NextContinuationToken")
+                        if continuation_token is None:
+                            break
+                    else:
+                        break
+
+            for directory_prefix in directory_prefixes:
+                continuation_token = None
+                while True:
+                    if max_objects is not None and total_deleted >= max_objects:
+                        break
+
+                    list_kwargs = {"Bucket": self.bucket_name, "Prefix": directory_prefix}
+                    if continuation_token:
+                        list_kwargs["ContinuationToken"] = continuation_token
+
+                    response = await asyncio.to_thread(
+                        self.s3_client.list_objects_v2, **list_kwargs
+                    )
+
+                    contents = response.get("Contents", []) or []
+                    if not contents and not response.get("IsTruncated"):
+                        break
+
+                    keys_to_delete = [
+                        obj.get("Key") for obj in contents if obj.get("Key")
+                    ]
+
+                    for start_index in range(
+                        0, len(keys_to_delete), S3_LOG_RETENTION_DELETE_BATCH_SIZE
+                    ):
+                        if max_objects is not None and total_deleted >= max_objects:
+                            break
+
+                        batch_keys = keys_to_delete[
+                            start_index : start_index
+                            + S3_LOG_RETENTION_DELETE_BATCH_SIZE
+                        ]
+
+                        if max_objects is not None:
+                            remaining = max_objects - total_deleted
+                            if remaining <= 0:
+                                break
+                            batch_keys = batch_keys[:remaining]
+
+                        if not batch_keys:
+                            continue
+
+                        await asyncio.to_thread(
+                            self.s3_client.delete_objects,
+                            Bucket=self.bucket_name,
+                            Delete={
+                                "Objects": [{"Key": batch_key} for batch_key in batch_keys]
+                            },
+                        )
+                        total_deleted += len(batch_keys)
+                        verbose_logger.info(
+                            "Deleted %s S3 log objects", len(batch_keys)
+                        )
+
+                    if response.get("IsTruncated"):
+                        continuation_token = response.get("NextContinuationToken")
+                        if continuation_token is None:
+                            break
+                    else:
+                        break
+
+        except Exception as exc:
+            verbose_logger.exception(
+                "Error while running S3 log retention: %s", str(exc)
+            )
+            return total_deleted
+
+        return total_deleted
 
 
 def get_s3_object_key(
