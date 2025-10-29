@@ -1,5 +1,6 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -155,3 +156,146 @@ class TestS3V2UnitTests:
         assert url_download == expected_download_url, f"Expected download URL {expected_download_url}, got {url_download}"
 
         assert result == {"downloaded": "data"}
+
+
+def test_s3_v2_logger_async_cleanup_old_logs():
+    with patch("asyncio.create_task", return_value=None), patch(
+        "litellm.integrations.s3_v2.CustomBatchLogger.periodic_flush",
+        return_value=None,
+    ):
+        s3_logger = S3Logger(
+            s3_bucket_name="test-bucket",
+            s3_region_name="us-east-1",
+        )
+        s3_logger.s3_path = "logs"
+
+        mock_credentials = SimpleNamespace(
+            access_key="access",
+            secret_key="secret",
+            token="token",
+        )
+
+        now = datetime.now(timezone.utc)
+        old_prefix = (now - timedelta(days=3)).strftime("%Y-%m-%d")
+        recent_prefix = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        mock_client = MagicMock()
+        mock_client.list_objects_v2.side_effect = [
+            {
+                "CommonPrefixes": [
+                    {"Prefix": f"logs/{old_prefix}/"},
+                    {"Prefix": f"logs/{recent_prefix}/"},
+                ],
+                "IsTruncated": False,
+            },
+            {
+                "Contents": [
+                    {"Key": f"logs/{old_prefix}/old-1.json"},
+                    {"Key": f"logs/{old_prefix}/old-2.json"},
+                ],
+                "IsTruncated": False,
+            },
+        ]
+        mock_client.delete_objects.return_value = {
+            "Deleted": [
+                {"Key": f"logs/{old_prefix}/old-1.json"},
+                {"Key": f"logs/{old_prefix}/old-2.json"},
+            ]
+        }
+
+        async def fake_to_thread(func, /, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch.object(S3Logger, "get_credentials", return_value=mock_credentials):
+            with patch("boto3.client", return_value=mock_client):
+                with patch(
+                    "litellm.integrations.s3_v2.asyncio.to_thread",
+                    side_effect=fake_to_thread,
+                ):
+                    deleted = asyncio.run(
+                        s3_logger.async_cleanup_old_logs(
+                            retention_seconds=2 * 24 * 60 * 60,
+                            max_objects=None,
+                        )
+                    )
+
+    assert deleted == 2
+    list_calls = mock_client.list_objects_v2.call_args_list
+    assert list_calls[0].kwargs == {
+        "Bucket": "test-bucket",
+        "Prefix": "logs/",
+        "Delimiter": "/",
+    }
+    assert list_calls[1].kwargs == {
+        "Bucket": "test-bucket",
+        "Prefix": f"logs/{old_prefix}/",
+    }
+    delete_call = mock_client.delete_objects.call_args
+    assert delete_call is not None
+    assert delete_call.kwargs["Delete"]["Objects"] == [
+        {"Key": f"logs/{old_prefix}/old-1.json"},
+        {"Key": f"logs/{old_prefix}/old-2.json"},
+    ]
+
+
+def test_legacy_s3_logger_async_cleanup_old_logs():
+    from litellm.integrations.s3 import S3Logger as LegacyS3Logger
+
+    mock_client = MagicMock()
+    now = datetime.now(timezone.utc)
+    old_prefix = (now - timedelta(days=4)).strftime("%Y-%m-%d")
+    recent_prefix = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    mock_client.list_objects_v2.side_effect = [
+        {
+            "CommonPrefixes": [
+                {"Prefix": f"logs/{old_prefix}/"},
+                {"Prefix": f"logs/{recent_prefix}/"},
+            ],
+            "IsTruncated": False,
+        },
+        {
+            "Contents": [
+                {"Key": f"logs/{old_prefix}/old.json"},
+            ],
+            "IsTruncated": False,
+        },
+    ]
+    mock_client.delete_objects.return_value = {
+        "Deleted": [{"Key": f"logs/{old_prefix}/old.json"}]
+    }
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    with patch("boto3.client", return_value=mock_client):
+        legacy_logger = LegacyS3Logger(
+            s3_bucket_name="legacy-bucket", s3_region_name="us-east-1"
+        )
+        legacy_logger.s3_path = "logs"
+
+        with patch(
+            "litellm.integrations.s3.asyncio.to_thread", side_effect=fake_to_thread
+        ):
+            deleted = asyncio.run(
+                legacy_logger.async_cleanup_old_logs(
+                    retention_seconds=2 * 24 * 60 * 60,
+                    max_objects=None,
+                )
+            )
+
+    assert deleted == 1
+    list_calls = mock_client.list_objects_v2.call_args_list
+    assert list_calls[0].kwargs == {
+        "Bucket": "legacy-bucket",
+        "Prefix": "logs/",
+        "Delimiter": "/",
+    }
+    assert list_calls[1].kwargs == {
+        "Bucket": "legacy-bucket",
+        "Prefix": f"logs/{old_prefix}/",
+    }
+    delete_call = mock_client.delete_objects.call_args
+    assert delete_call is not None
+    assert delete_call.kwargs["Delete"]["Objects"] == [
+        {"Key": f"logs/{old_prefix}/old.json"}
+    ]
