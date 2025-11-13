@@ -1,9 +1,39 @@
+from typing import Optional, Tuple
+
 from litellm._uuid import uuid
-from typing import Optional
 
 import litellm
 from litellm._logging import verbose_logger
 from litellm.litellm_core_utils.core_helpers import safe_deep_copy
+
+from litellm.exceptions import OpenAIError as LiteLLMOpenAIError
+from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
+
+try:  # pragma: no cover - defensive import for optional dependency variations
+    from openai import OpenAIError as SDKOpenAIError  # type: ignore
+    from openai import RateLimitError as SDKRateLimitError  # type: ignore
+except Exception:  # pragma: no cover - openai import should exist but guard regardless
+    SDKOpenAIError = ()  # type: ignore[assignment]
+    SDKRateLimitError = ()  # type: ignore[assignment]
+
+
+_RATE_LIMIT_ERROR_TYPES: Tuple[type, ...] = (LiteLLMRateLimitError,)
+if isinstance(SDKRateLimitError, type):
+    _RATE_LIMIT_ERROR_TYPES = _RATE_LIMIT_ERROR_TYPES + (SDKRateLimitError,)
+
+_OPENAI_ERROR_TYPES: Tuple[type, ...] = (LiteLLMOpenAIError,)
+if isinstance(SDKOpenAIError, type):
+    _OPENAI_ERROR_TYPES = _OPENAI_ERROR_TYPES + (SDKOpenAIError,)
+
+
+def _should_attempt_fallback(exc: Exception) -> bool:
+    """Return True if we should attempt the next fallback for the given exception."""
+
+    if isinstance(exc, _RATE_LIMIT_ERROR_TYPES):
+        return True
+    if isinstance(exc, _OPENAI_ERROR_TYPES):
+        return False
+    return True
 
 from .asyncify import run_async_function
 
@@ -44,8 +74,9 @@ async def async_completion_with_fallbacks(**kwargs):
             completion_kwargs = safe_deep_copy(base_kwargs)
             # Handle dictionary fallback configurations
             if isinstance(fallback, dict):
-                model = fallback.pop("model", original_model)
-                completion_kwargs.update(fallback)
+                fallback_config = safe_deep_copy(fallback)
+                model = fallback_config.pop("model", original_model)
+                completion_kwargs.update(fallback_config)
             else:
                 model = fallback
 
@@ -62,6 +93,8 @@ async def async_completion_with_fallbacks(**kwargs):
             verbose_logger.exception(
                 f"Fallback attempt failed for model {model}: {str(e)}"
             )
+            if not _should_attempt_fallback(e):
+                raise
             most_recent_exception_str = str(e)
             continue
 

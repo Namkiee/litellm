@@ -63,7 +63,11 @@ from litellm.constants import (
     DEFAULT_MOCK_RESPONSE_COMPLETION_TOKEN_COUNT,
     DEFAULT_MOCK_RESPONSE_PROMPT_TOKEN_COUNT,
 )
-from litellm.exceptions import LiteLLMUnknownProvider
+from litellm.exceptions import (
+    LiteLLMUnknownProvider,
+    OpenAIError as LiteLLMOpenAIError,
+    RateLimitError as LiteLLMRateLimitError,
+)
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.audio_utils.utils import get_audio_file_for_health_check
 from litellm.litellm_core_utils.dd_tracing import tracer
@@ -123,6 +127,30 @@ from litellm.utils import (
     validate_and_fix_openai_tools,
     validate_chat_completion_tool_choice,
 )
+
+try:  # pragma: no cover - guard for optional SDK availability
+    from openai import OpenAIError as SDKOpenAIError  # type: ignore
+    from openai import RateLimitError as SDKRateLimitError  # type: ignore
+except Exception:  # pragma: no cover - openai import should normally succeed
+    SDKOpenAIError = ()  # type: ignore[assignment]
+    SDKRateLimitError = ()  # type: ignore[assignment]
+
+
+_RATE_LIMIT_ERROR_TYPES: Tuple[type, ...] = (LiteLLMRateLimitError,)
+if isinstance(SDKRateLimitError, type):
+    _RATE_LIMIT_ERROR_TYPES = _RATE_LIMIT_ERROR_TYPES + (SDKRateLimitError,)
+
+_OPENAI_ERROR_TYPES: Tuple[type, ...] = (LiteLLMOpenAIError,)
+if isinstance(SDKOpenAIError, type):
+    _OPENAI_ERROR_TYPES = _OPENAI_ERROR_TYPES + (SDKOpenAIError,)
+
+
+def _should_retry_exception(exc: BaseException) -> bool:
+    if isinstance(exc, _RATE_LIMIT_ERROR_TYPES):
+        return False
+    if isinstance(exc, _OPENAI_ERROR_TYPES):
+        return False
+    return True
 
 from ._logging import verbose_logger
 from .caching.caching import disable_cache, enable_cache, update_cache
@@ -3758,15 +3786,19 @@ def completion_with_retries(*args, **kwargs):
         "retry_strategy", "constant_retry"
     )  # type: ignore
     original_function = kwargs.pop("original_function", completion)
+    retry_condition = tenacity.retry_if_exception(_should_retry_exception)
     if retry_strategy == "exponential_backoff_retry":
         retryer = tenacity.Retrying(
             wait=tenacity.wait_exponential(multiplier=1, max=10),
             stop=tenacity.stop_after_attempt(num_retries),
+            retry=retry_condition,
             reraise=True,
         )
     else:
         retryer = tenacity.Retrying(
-            stop=tenacity.stop_after_attempt(num_retries), reraise=True
+            stop=tenacity.stop_after_attempt(num_retries),
+            retry=retry_condition,
+            reraise=True,
         )
     return retryer(original_function, *args, **kwargs)
 
@@ -3788,15 +3820,19 @@ async def acompletion_with_retries(*args, **kwargs):
     kwargs["num_retries"] = 0
     retry_strategy = kwargs.pop("retry_strategy", "constant_retry")
     original_function = kwargs.pop("original_function", completion)
+    retry_condition = tenacity.retry_if_exception(_should_retry_exception)
     if retry_strategy == "exponential_backoff_retry":
         retryer = tenacity.AsyncRetrying(
             wait=tenacity.wait_exponential(multiplier=1, max=10),
             stop=tenacity.stop_after_attempt(num_retries),
+            retry=retry_condition,
             reraise=True,
         )
     else:
         retryer = tenacity.AsyncRetrying(
-            stop=tenacity.stop_after_attempt(num_retries), reraise=True
+            stop=tenacity.stop_after_attempt(num_retries),
+            retry=retry_condition,
+            reraise=True,
         )
     return await retryer(original_function, *args, **kwargs)
 
